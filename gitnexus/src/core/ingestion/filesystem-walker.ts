@@ -33,11 +33,13 @@ export const walkRepositoryPaths = async (
   onProgress?: (current: number, total: number, filePath: string) => void
 ): Promise<ScannedFile[]> => {
   const ignoreFilter = await createIgnoreFilter(repoPath);
+  const followSymlinks = !!process.env.GITNEXUS_FOLLOW_SYMLINKS;
 
   const filtered = await glob('**/*', {
     cwd: repoPath,
     nodir: true,
     dot: false,
+    follow: followSymlinks,
     ignore: ignoreFilter,
   });
   const entries: ScannedFile[] = [];

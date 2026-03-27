@@ -71,10 +71,26 @@ export interface AnalyzeOptions {
   /** Explicitly disable incremental mode (--no-incremental). When undefined,
    *  incremental is auto-enabled if meta.json exists and lastCommit differs. */
   incremental?: boolean;
+  /** Skip .gitignore parsing — recovers files excluded by overly broad patterns. */
+  noGitignore?: boolean;
+  /** Follow symbolic links during file discovery. */
+  followSymlinks?: boolean;
 }
 
-/** Threshold: auto-skip embeddings for repos with more nodes than this */
-const EMBEDDING_NODE_LIMIT = 50_000;
+/** Threshold: auto-skip embeddings for repos with more nodes than this.
+ *  Configurable via GITNEXUS_EMBEDDING_NODE_LIMIT env var.
+ *  When an HTTP endpoint is configured (GITNEXUS_EMBEDDING_URL), the limit
+ *  is raised to 2M by default since remote GPUs handle scale effortlessly. */
+const getEmbeddingNodeLimit = (): number => {
+  const envLimit = process.env.GITNEXUS_EMBEDDING_NODE_LIMIT;
+  if (envLimit) {
+    const parsed = parseInt(envLimit, 10);
+    if (!Number.isNaN(parsed) && parsed > 0) return parsed;
+  }
+  const hasHttpEndpoint = !!process.env.GITNEXUS_EMBEDDING_URL && !!process.env.GITNEXUS_EMBEDDING_MODEL;
+  return hasHttpEndpoint ? 2_000_000 : 50_000;
+};
+const EMBEDDING_NODE_LIMIT = getEmbeddingNodeLimit();
 
 const PHASE_LABELS: Record<string, string> = {
   extracting: 'Scanning files',
@@ -164,6 +180,14 @@ export const analyzeCommand = async (
 
   if (options?.verbose) {
     process.env.GITNEXUS_VERBOSE = '1';
+  }
+
+  if (options?.noGitignore) {
+    process.env.GITNEXUS_NO_GITIGNORE = '1';
+  }
+
+  if (options?.followSymlinks) {
+    process.env.GITNEXUS_FOLLOW_SYMLINKS = '1';
   }
 
   console.log('\n  GitNexus Analyzer\n');

@@ -71,14 +71,18 @@ export const getCommunityColor = (communityIndex: number): string => {
   return COMMUNITY_COLORS[communityIndex % COMMUNITY_COLORS.length];
 };
 
-// Node types that participate in community detection
-const SYMBOL_TABLES = ['Function', 'Class', 'Method', 'Interface'] as const;
+// Node types that participate in community detection.
+// For graphs above COARSE_GRAPH_THRESHOLD, Method nodes are excluded to
+// reduce the projected graph size by ~60-70% — methods roll up into their
+// parent class, which preserves community structure at much lower cost.
+const FULL_SYMBOL_TABLES = ['Function', 'Class', 'Method', 'Interface'] as const;
+const COARSE_SYMBOL_TABLES = ['Function', 'Class', 'Interface'] as const;
 
-// Relationship types used for clustering (same set as the old Graphology version)
 const CLUSTERING_REL_TYPES = ['CALLS', 'EXTENDS', 'IMPLEMENTS'] as const;
 
 const MIN_CONFIDENCE_LARGE = 0.5;
 const LARGE_GRAPH_THRESHOLD = 10_000;
+const COARSE_GRAPH_THRESHOLD = 25_000;
 
 // ============================================================================
 // MAIN PROCESSOR — runs Louvain inside LadybugDB
@@ -98,7 +102,7 @@ export const processCommunitiesInDB = async (
 
   await loadAlgoExtensionSafe(executeQuery);
 
-  // Count symbol nodes to determine if graph is empty / large
+  // Count symbol nodes to determine if graph is empty / large / coarse
   const symbolCount = await countSymbolNodes(executeQuery);
   if (symbolCount === 0) {
     return {
@@ -109,24 +113,27 @@ export const processCommunitiesInDB = async (
   }
 
   const isLarge = symbolCount > LARGE_GRAPH_THRESHOLD;
+  const useCoarse = symbolCount > COARSE_GRAPH_THRESHOLD;
+  const SYMBOL_TABLES = useCoarse ? COARSE_SYMBOL_TABLES : FULL_SYMBOL_TABLES;
+  const modeLabel = useCoarse ? 'coarse mode (excluding Methods)' : isLarge ? 'large-graph mode' : '';
   onProgress?.(
-    `Projecting graph with ${symbolCount} symbol nodes${isLarge ? ' (large-graph mode)' : ''}...`,
+    `Projecting graph with ${symbolCount} symbol nodes${modeLabel ? ` (${modeLabel})` : ''}...`,
     10,
   );
 
-  // Project a filtered subgraph for community detection
   const relFilter = isLarge
     ? `r.type IN ["CALLS", "EXTENDS", "IMPLEMENTS"] AND r.confidence >= ${MIN_CONFIDENCE_LARGE}`
     : `r.type IN ["CALLS", "EXTENDS", "IMPLEMENTS"]`;
 
   const projectedName = 'community_graph';
+  const projectedTables = `[${SYMBOL_TABLES.map(t => `'${t}'`).join(', ')}]`;
 
   let louvainRows: Array<{ nodeId: string; communityId: number }> = [];
 
   try {
     await executeQuery(
       `CALL PROJECT_GRAPH('${projectedName}', ` +
-      `['Function', 'Class', 'Method', 'Interface'], ` +
+      `${projectedTables}, ` +
       `{'CodeRelation': '${relFilter}'})`,
     );
 
@@ -287,7 +294,7 @@ async function loadAlgoExtensionSafe(executeQuery: ExecuteQueryFn): Promise<void
 
 async function countSymbolNodes(executeQuery: ExecuteQueryFn): Promise<number> {
   let total = 0;
-  for (const table of SYMBOL_TABLES) {
+  for (const table of FULL_SYMBOL_TABLES) {
     try {
       const rows = await executeQuery(`MATCH (n:${table}) RETURN count(n) AS cnt`);
       total += Number(rows[0]?.cnt ?? 0);

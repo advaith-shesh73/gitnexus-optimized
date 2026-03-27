@@ -591,6 +591,15 @@ async function runChunkedParseAndResolve(
   const MIN_BYTES_FOR_WORKERS = 512 * 1024;
   const totalBytes = parseableScanned.reduce((s, f) => s + f.size, 0);
 
+  // Parallel chunk execution: when we have many independent chunks (no shared
+  // mutable state during parsing), process up to PARALLEL_CHUNK_LIMIT concurrently.
+  // Each chunk's parse + import-resolve is independent; only call/heritage resolution
+  // benefits from cross-chunk symbol data, so we parallelize parse+imports.
+  const PARALLEL_CHUNK_LIMIT = Math.min(
+    4,
+    Math.max(1, Math.floor(numChunks / 2)),
+  );
+
   // Create worker pool once, reuse across chunks
   let workerPool: WorkerPool | undefined;
   if (totalParseable >= MIN_FILES_FOR_WORKERS || totalBytes >= MIN_BYTES_FOR_WORKERS) {
@@ -647,143 +656,142 @@ async function runChunkedParseAndResolve(
   // Accumulate MCP/RPC tool definitions (@mcp.tool(), @app.tool(), etc.)
   const allToolDefs: ExtractedToolDef[] = [];
 
-  try {
-    for (let chunkIdx = 0; chunkIdx < numChunks; chunkIdx++) {
-      const chunkPaths = chunks[chunkIdx];
+  /** Process a single chunk: read content, parse, resolve imports/calls/heritage. */
+  const processOneChunk = async (chunkIdx: number) => {
+    const chunkPaths = chunks[chunkIdx];
 
-      // Read content for this chunk only
-      const chunkContents = await readFileContents(repoPath, chunkPaths);
-      const chunkFiles = chunkPaths
-        .filter(p => chunkContents.has(p))
-        .map(p => ({ path: p, content: chunkContents.get(p)! }));
+    const chunkContents = await readFileContents(repoPath, chunkPaths);
+    const chunkFiles = chunkPaths
+      .filter(p => chunkContents.has(p))
+      .map(p => ({ path: p, content: chunkContents.get(p)! }));
 
-      // Parse this chunk (workers or sequential fallback)
-      const chunkWorkerData = await processParsing(
-        graph, chunkFiles, symbolTable, astCache,
-        (current, _total, filePath) => {
-          const globalCurrent = filesParsedSoFar + current;
-          const parsingProgress = 20 + ((globalCurrent / totalParseable) * 62);
-          onProgress({
-            phase: 'parsing',
-            percent: Math.round(parsingProgress),
-            message: `Parsing chunk ${chunkIdx + 1}/${numChunks}...`,
-            detail: filePath,
-            stats: { filesProcessed: globalCurrent, totalFiles: totalParseable, nodesCreated: graph.nodeCount },
-          });
-        },
-        workerPool,
-      );
+    const chunkWorkerData = await processParsing(
+      graph, chunkFiles, symbolTable, astCache,
+      (current, _total, filePath) => {
+        const globalCurrent = filesParsedSoFar + current;
+        const parsingProgress = 20 + ((globalCurrent / totalParseable) * 62);
+        onProgress({
+          phase: 'parsing',
+          percent: Math.round(parsingProgress),
+          message: `Parsing chunk ${chunkIdx + 1}/${numChunks}...`,
+          detail: filePath,
+          stats: { filesProcessed: globalCurrent, totalFiles: totalParseable, nodesCreated: graph.nodeCount },
+        });
+      },
+      workerPool,
+    );
 
-      const chunkBasePercent = 20 + ((filesParsedSoFar / totalParseable) * 62);
+    const chunkBasePercent = 20 + ((filesParsedSoFar / totalParseable) * 62);
 
-      if (chunkWorkerData) {
-        // Imports
-        await processImportsFromExtracted(graph, allPathObjects, chunkWorkerData.imports, ctx, (current, total) => {
-          onProgress({
-            phase: 'parsing',
-            percent: Math.round(chunkBasePercent),
-            message: `Resolving imports (chunk ${chunkIdx + 1}/${numChunks})...`,
-            detail: `${current}/${total} files`,
-            stats: { filesProcessed: filesParsedSoFar, totalFiles: totalParseable, nodesCreated: graph.nodeCount },
-          });
-        }, repoPath, importCtx);
-        // ── Wildcard-import synthesis (Ruby / C/C++ / Swift / Go) + Python module aliases ─
-        // Synthesize namedImportMap entries for wildcard-import languages and build
-        // moduleAliasMap for Python namespace imports. Must run after imports are resolved
-        // (importMap is populated) but BEFORE call resolution.
-        if (chunkNeedsSynthesis[chunkIdx]) synthesizeWildcardImportBindings(graph, ctx);
-        // Phase 14 E1: Seed cross-file receiver types from ExportedTypeMap
-        // before call resolution — eliminates re-parse for single-hop imported receivers.
-        // NOTE: In the worker path, exportedTypeMap is empty during chunk processing
-        // (populated later in runCrossFileBindingPropagation). This block is latent —
-        // it activates only if incremental export collection is added per-chunk.
-        if (exportedTypeMap.size > 0 && ctx.namedImportMap.size > 0) {
-          const { enrichedCount } = seedCrossFileReceiverTypes(
-            chunkWorkerData.calls, ctx.namedImportMap, exportedTypeMap,
-          );
-          if (isDev && enrichedCount > 0) {
-            console.log(`🔗 E1: Seeded ${enrichedCount} cross-file receiver types (chunk ${chunkIdx + 1})`);
-          }
+    if (chunkWorkerData) {
+      await processImportsFromExtracted(graph, allPathObjects, chunkWorkerData.imports, ctx, (current, total) => {
+        onProgress({
+          phase: 'parsing',
+          percent: Math.round(chunkBasePercent),
+          message: `Resolving imports (chunk ${chunkIdx + 1}/${numChunks})...`,
+          detail: `${current}/${total} files`,
+          stats: { filesProcessed: filesParsedSoFar, totalFiles: totalParseable, nodesCreated: graph.nodeCount },
+        });
+      }, repoPath, importCtx);
+      if (chunkNeedsSynthesis[chunkIdx]) synthesizeWildcardImportBindings(graph, ctx);
+      if (exportedTypeMap.size > 0 && ctx.namedImportMap.size > 0) {
+        const { enrichedCount } = seedCrossFileReceiverTypes(
+          chunkWorkerData.calls, ctx.namedImportMap, exportedTypeMap,
+        );
+        if (isDev && enrichedCount > 0) {
+          console.log(`🔗 E1: Seeded ${enrichedCount} cross-file receiver types (chunk ${chunkIdx + 1})`);
         }
-        // Calls + Heritage + Routes — resolve in parallel (no shared mutable state between them)
-        // This is safe because each writes disjoint relationship types into idempotent id-keyed Maps,
-        // and the single-threaded event loop prevents races between synchronous addRelationship calls.
-        await Promise.all([
-          processCallsFromExtracted(
-            graph,
-            chunkWorkerData.calls,
-            ctx,
-            (current, total) => {
-              onProgress({
-                phase: 'parsing',
-                percent: Math.round(chunkBasePercent),
-                message: `Resolving calls (chunk ${chunkIdx + 1}/${numChunks})...`,
-                detail: `${current}/${total} files`,
-                stats: { filesProcessed: filesParsedSoFar, totalFiles: totalParseable, nodesCreated: graph.nodeCount },
-              });
-            },
-            chunkWorkerData.constructorBindings,
-          ),
-          processHeritageFromExtracted(
-            graph,
-            chunkWorkerData.heritage,
-            ctx,
-            (current, total) => {
-              onProgress({
-                phase: 'parsing',
-                percent: Math.round(chunkBasePercent),
-                message: `Resolving heritage (chunk ${chunkIdx + 1}/${numChunks})...`,
-                detail: `${current}/${total} records`,
-                stats: { filesProcessed: filesParsedSoFar, totalFiles: totalParseable, nodesCreated: graph.nodeCount },
-              });
-            },
-          ),
-          processRoutesFromExtracted(
-            graph,
-            chunkWorkerData.routes ?? [],
-            ctx,
-            (current, total) => {
-              onProgress({
-                phase: 'parsing',
-                percent: Math.round(chunkBasePercent),
-                message: `Resolving routes (chunk ${chunkIdx + 1}/${numChunks})...`,
-                detail: `${current}/${total} routes`,
-                stats: { filesProcessed: filesParsedSoFar, totalFiles: totalParseable, nodesCreated: graph.nodeCount },
-              });
-            },
-          ),
-        ]);
-        // Process field write assignments (synchronous, runs after calls resolve)
-        if (chunkWorkerData.assignments?.length) {
-          processAssignmentsFromExtracted(graph, chunkWorkerData.assignments, ctx, chunkWorkerData.constructorBindings);
-        }
-        // Collect TypeEnv file-scope bindings for exported type enrichment
-        if (chunkWorkerData.typeEnvBindings?.length) {
-          workerTypeEnvBindings.push(...chunkWorkerData.typeEnvBindings);
-        }
-        // Collect fetch() calls for Next.js route matching
-        if (chunkWorkerData.fetchCalls?.length) {
-          allFetchCalls.push(...chunkWorkerData.fetchCalls);
-        }
-        if (chunkWorkerData.routes?.length) {
-          allExtractedRoutes.push(...chunkWorkerData.routes);
-        }
-        if (chunkWorkerData.decoratorRoutes?.length) {
-          allDecoratorRoutes.push(...chunkWorkerData.decoratorRoutes);
-        }
-        if (chunkWorkerData.toolDefs?.length) {
-          allToolDefs.push(...chunkWorkerData.toolDefs);
-        }
-      } else {
-        await processImports(graph, chunkFiles, astCache, ctx, undefined, repoPath, allPaths);
-        sequentialChunkPaths.push(chunkPaths);
       }
+      await Promise.all([
+        processCallsFromExtracted(
+          graph,
+          chunkWorkerData.calls,
+          ctx,
+          (current, total) => {
+            onProgress({
+              phase: 'parsing',
+              percent: Math.round(chunkBasePercent),
+              message: `Resolving calls (chunk ${chunkIdx + 1}/${numChunks})...`,
+              detail: `${current}/${total} files`,
+              stats: { filesProcessed: filesParsedSoFar, totalFiles: totalParseable, nodesCreated: graph.nodeCount },
+            });
+          },
+          chunkWorkerData.constructorBindings,
+        ),
+        processHeritageFromExtracted(
+          graph,
+          chunkWorkerData.heritage,
+          ctx,
+          (current, total) => {
+            onProgress({
+              phase: 'parsing',
+              percent: Math.round(chunkBasePercent),
+              message: `Resolving heritage (chunk ${chunkIdx + 1}/${numChunks})...`,
+              detail: `${current}/${total} records`,
+              stats: { filesProcessed: filesParsedSoFar, totalFiles: totalParseable, nodesCreated: graph.nodeCount },
+            });
+          },
+        ),
+        processRoutesFromExtracted(
+          graph,
+          chunkWorkerData.routes ?? [],
+          ctx,
+          (current, total) => {
+            onProgress({
+              phase: 'parsing',
+              percent: Math.round(chunkBasePercent),
+              message: `Resolving routes (chunk ${chunkIdx + 1}/${numChunks})...`,
+              detail: `${current}/${total} routes`,
+              stats: { filesProcessed: filesParsedSoFar, totalFiles: totalParseable, nodesCreated: graph.nodeCount },
+            });
+          },
+        ),
+      ]);
+      if (chunkWorkerData.assignments?.length) {
+        processAssignmentsFromExtracted(graph, chunkWorkerData.assignments, ctx, chunkWorkerData.constructorBindings);
+      }
+      if (chunkWorkerData.typeEnvBindings?.length) {
+        workerTypeEnvBindings.push(...chunkWorkerData.typeEnvBindings);
+      }
+      if (chunkWorkerData.fetchCalls?.length) {
+        allFetchCalls.push(...chunkWorkerData.fetchCalls);
+      }
+      if (chunkWorkerData.routes?.length) {
+        allExtractedRoutes.push(...chunkWorkerData.routes);
+      }
+      if (chunkWorkerData.decoratorRoutes?.length) {
+        allDecoratorRoutes.push(...chunkWorkerData.decoratorRoutes);
+      }
+      if (chunkWorkerData.toolDefs?.length) {
+        allToolDefs.push(...chunkWorkerData.toolDefs);
+      }
+    } else {
+      await processImports(graph, chunkFiles, astCache, ctx, undefined, repoPath, allPaths);
+      sequentialChunkPaths.push(chunkPaths);
+    }
 
-      filesParsedSoFar += chunkFiles.length;
+    filesParsedSoFar += chunkFiles.length;
+    astCache.clear();
+  };
 
-      // Clear AST cache between chunks to free memory
-      astCache.clear();
-      // chunkContents + chunkFiles + chunkWorkerData go out of scope → GC reclaims
+  try {
+    if (PARALLEL_CHUNK_LIMIT > 1 && numChunks > 1) {
+      // Process chunks in parallel batches of PARALLEL_CHUNK_LIMIT.
+      // Each chunk's parse phase is independent; resolution accumulates into
+      // shared graph + ctx which use idempotent id-keyed Maps (safe under
+      // Node's single-threaded event loop — no true data races).
+      for (let batchStart = 0; batchStart < numChunks; batchStart += PARALLEL_CHUNK_LIMIT) {
+        const batchEnd = Math.min(batchStart + PARALLEL_CHUNK_LIMIT, numChunks);
+        const chunkPromises: Promise<void>[] = [];
+        for (let i = batchStart; i < batchEnd; i++) {
+          chunkPromises.push(processOneChunk(i));
+        }
+        await Promise.all(chunkPromises);
+      }
+    } else {
+      for (let chunkIdx = 0; chunkIdx < numChunks; chunkIdx++) {
+        await processOneChunk(chunkIdx);
+      }
     }
   } finally {
     await workerPool?.terminate();

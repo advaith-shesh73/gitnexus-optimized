@@ -210,43 +210,40 @@ export const runEmbeddingPipeline = async (
       return;
     }
 
-    // Phase 3: Batch embed nodes
-    const batchSize = finalConfig.batchSize;
-    const totalBatches = Math.ceil(totalNodes / batchSize);
-    let processedNodes = 0;
-
+    // Phase 3a: Pre-generate ALL embedding texts up front (fast, CPU-only)
     onProgress({
       phase: 'embedding',
       percent: 20,
       nodesProcessed: 0,
       totalNodes,
-      currentBatch: 0,
-      totalBatches,
     });
+
+    const allTexts = generateBatchEmbeddingTexts(nodes, finalConfig);
+
+    // Phase 3b: Batch embed all texts (GPU/HTTP — the expensive part)
+    const batchSize = finalConfig.batchSize;
+    const totalBatches = Math.ceil(totalNodes / batchSize);
+    let processedNodes = 0;
+
+    const allEmbeddings: Array<{ id: string; embedding: number[] }> = [];
 
     for (let batchIndex = 0; batchIndex < totalBatches; batchIndex++) {
       const start = batchIndex * batchSize;
       const end = Math.min(start + batchSize, totalNodes);
-      const batch = nodes.slice(start, end);
+      const batchTexts = allTexts.slice(start, end);
 
-      // Generate texts for this batch
-      const texts = generateBatchEmbeddingTexts(batch, finalConfig);
+      const embeddings = await embedBatch(batchTexts);
 
-      // Embed the batch
-      const embeddings = await embedBatch(texts);
+      for (let i = 0; i < embeddings.length; i++) {
+        allEmbeddings.push({
+          id: nodes[start + i].id,
+          embedding: embeddingToArray(embeddings[i]),
+        });
+      }
 
-      // Update LadybugDB with embeddings
-      const updates = batch.map((node, i) => ({
-        id: node.id,
-        embedding: embeddingToArray(embeddings[i]),
-      }));
+      processedNodes += batchTexts.length;
 
-      await batchInsertEmbeddings(executeWithReusedStatement, updates);
-
-      processedNodes += batch.length;
-
-      // Report progress (20-90% for embedding phase)
-      const embeddingProgress = 20 + ((processedNodes / totalNodes) * 70);
+      const embeddingProgress = 20 + ((processedNodes / totalNodes) * 50);
       onProgress({
         phase: 'embedding',
         percent: Math.round(embeddingProgress),
@@ -254,6 +251,28 @@ export const runEmbeddingPipeline = async (
         totalNodes,
         currentBatch: batchIndex + 1,
         totalBatches,
+      });
+    }
+
+    // Phase 3c: Bulk insert all embeddings into DB (single large write)
+    onProgress({
+      phase: 'embedding',
+      percent: 75,
+      nodesProcessed: totalNodes,
+      totalNodes,
+    });
+
+    const DB_INSERT_BATCH = 500;
+    for (let i = 0; i < allEmbeddings.length; i += DB_INSERT_BATCH) {
+      const chunk = allEmbeddings.slice(i, i + DB_INSERT_BATCH);
+      await batchInsertEmbeddings(executeWithReusedStatement, chunk);
+
+      const insertProgress = 75 + ((Math.min(i + DB_INSERT_BATCH, allEmbeddings.length) / allEmbeddings.length) * 15);
+      onProgress({
+        phase: 'embedding',
+        percent: Math.round(insertProgress),
+        nodesProcessed: totalNodes,
+        totalNodes,
       });
     }
 

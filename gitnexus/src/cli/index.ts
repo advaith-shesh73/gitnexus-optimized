@@ -30,8 +30,9 @@ program
   .option('--skills', 'Generate repo-specific skill files from detected communities')
   .option('--no-incremental', 'Force full rebuild even when incremental is available')
   .option('--skip-git', 'Index a folder without requiring a .git directory')
+  .option('--no-gitignore', 'Skip .gitignore parsing (still reads .gitnexusignore)')
+  .option('--follow-symlinks', 'Follow symbolic links during file discovery')
    .option('-v, --verbose', 'Enable verbose ingestion warnings (default: false)')
-   .addHelpText('after', '\nEnvironment variables:\n  GITNEXUS_NO_GITIGNORE=1  Skip .gitignore parsing (still reads .gitnexusignore)')
    .action(createLazyAction(() => import('./analyze.js'), 'analyzeCommand'));
 
 program
