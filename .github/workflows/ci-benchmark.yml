@@ -1,0 +1,128 @@
+name: Benchmark Gate
+
+on:
+  workflow_call:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'gitnexus/src/**'
+      - 'gitnexus/package.json'
+
+concurrency:
+  group: benchmark-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  benchmark:
+    name: Analyze performance
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+
+      - uses: ./.github/actions/setup-gitnexus
+        with:
+          build: 'true'
+
+      - name: Create fixture repo
+        run: |
+          mkdir -p /tmp/bench-repo/src
+          cd /tmp/bench-repo
+          git init --initial-branch=main
+          git config user.email "ci@test" && git config user.name "ci"
+
+          for i in $(seq 1 50); do
+            cat > "src/module${i}.ts" <<TSEOF
+          import { Logger } from './logger.js';
+          export class Service${i} {
+            private log = new Logger();
+            process(data: string): string { this.log.info(data); return data; }
+          }
+          TSEOF
+          done
+
+          cat > src/logger.ts <<'TSEOF'
+          export class Logger {
+            info(msg: string): void { console.log(msg); }
+            error(msg: string): void { console.error(msg); }
+          }
+          TSEOF
+
+          cat > src/index.ts <<'TSEOF'
+          export { Logger } from './logger.js';
+          TSEOF
+
+          git add -A && git commit -m "initial"
+
+      - name: Full index benchmark (3 runs, take median)
+        id: full
+        run: |
+          TIMES=()
+          for run in 1 2 3; do
+            rm -rf /tmp/bench-repo/.gitnexus
+            START=$(date +%s%N)
+            node gitnexus/dist/cli/index.js analyze /tmp/bench-repo --force 2>/dev/null
+            END=$(date +%s%N)
+            MS=$(( (END - START) / 1000000 ))
+            TIMES+=("$MS")
+            echo "  Full run ${run}: ${MS}ms"
+          done
+          IFS=$'\n' SORTED=($(sort -n <<<"${TIMES[*]}")); unset IFS
+          MEDIAN=${SORTED[1]}
+          echo "Full median: ${MEDIAN}ms (runs: ${TIMES[*]})"
+          echo "elapsed_ms=${MEDIAN}" >> "$GITHUB_OUTPUT"
+
+      - name: Create 1-file change
+        run: |
+          cd /tmp/bench-repo
+          echo "export function added() { return 42; }" >> src/module1.ts
+          git add -A && git commit -m "1-file change"
+
+      - name: Incremental 1-file benchmark (3 runs, take median)
+        id: incr1
+        run: |
+          # First run creates the incremental index; subsequent runs need
+          # fresh 1-file changes. We stash and re-apply between runs.
+          TIMES=()
+          for run in 1 2 3; do
+            START=$(date +%s%N)
+            node gitnexus/dist/cli/index.js analyze /tmp/bench-repo 2>/dev/null
+            END=$(date +%s%N)
+            MS=$(( (END - START) / 1000000 ))
+            TIMES+=("$MS")
+            echo "  Incremental run ${run}: ${MS}ms"
+
+            # Set up a fresh 1-file diff for the next run
+            if [ "$run" -lt 3 ]; then
+              cd /tmp/bench-repo
+              echo "// run${run}" >> src/module1.ts
+              git add -A && git commit -m "tweak run ${run}" --allow-empty
+              cd -
+            fi
+          done
+          IFS=$'\n' SORTED=($(sort -n <<<"${TIMES[*]}")); unset IFS
+          MEDIAN=${SORTED[1]}
+          echo "Incremental median: ${MEDIAN}ms (runs: ${TIMES[*]})"
+          echo "elapsed_ms=${MEDIAN}" >> "$GITHUB_OUTPUT"
+
+      - name: Assert incremental is faster than full
+        env:
+          FULL_MS: ${{ steps.full.outputs.elapsed_ms }}
+          INCR_MS: ${{ steps.incr1.outputs.elapsed_ms }}
+        run: |
+          echo "Full (median): ${FULL_MS}ms | Incremental (median): ${INCR_MS}ms"
+          RATIO=$(( INCR_MS * 100 / FULL_MS ))
+          echo "Ratio: ${RATIO}%"
+
+          if [ "$INCR_MS" -gt "$FULL_MS" ]; then
+            echo "::error::Incremental (${INCR_MS}ms) is slower than full rebuild (${FULL_MS}ms)"
+            exit 1
+          fi
+
+          THRESHOLD_60=$(( FULL_MS * 60 / 100 ))
+          if [ "$INCR_MS" -gt "$THRESHOLD_60" ]; then
+            echo "::warning::Incremental (${INCR_MS}ms) is > 60% of full (${FULL_MS}ms). Ratio: ${RATIO}%."
+          fi
+          echo "Benchmark passed: incremental is ${RATIO}% of full rebuild"

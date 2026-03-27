@@ -1,0 +1,6 @@
+# macOS: link against libc++ (needed for tree-sitter C++ parsers)
+[target.aarch64-apple-darwin]
+rustflags = ["-C", "link-arg=-lc++"]
+
+[target.x86_64-apple-darwin]
+rustflags = ["-C", "link-arg=-lc++"]
